@@ -19,7 +19,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
 
       - name: Install required packages
         run: |
@@ -35,7 +35,7 @@ jobs:
         run: ./build.sh --device ${{ matrix.device }}
 
       - name: Upload a Build Artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.device }}
           path: ./*.img
