@@ -4,148 +4,165 @@
  * SPDX-License-Identifier: BSD-2-Clause-Patent
  */
 
-#include <Library/BaseMemoryLib.h>
+#include <PiDxe.h>
+#include <Library/BaseLib.h>
 #include <Library/DebugLib.h>
-#include <Library/DevicePathLib.h>
-#include <Library/DxeServicesTableLib.h>
+#include <Library/BaseMemoryLib.h>
+#include <Library/UefiBootServicesTableLib.h>
+#include <Library/UefiLib.h>
+#include <Library/IoLib.h>
 #include <Library/MemoryAllocationLib.h>
 #include <Library/PcdLib.h>
-#include <Library/UefiBootServicesTableLib.h>
-#include <Library/UefiDriverEntryPoint.h>
-#include <Library/UefiLib.h>
-#include <Library/UefiRuntimeServicesTableLib.h>
-
 #include <Protocol/BlockIo.h>
 #include <Protocol/DevicePath.h>
-#include <Protocol/Sdhc.h>
-#include <Protocol/ComponentName.h>
-#include <Protocol/ComponentName2.h>
-#include <Protocol/DriverBinding.h>
+#include <Protocol/DiskIo.h>
+#include <Guid/PartitionInfo.h>
+#include <Library/DevicePathLib.h>
 
 #include "BlockDeviceDxe.h"
 
-// Debug level configuration
-#define DEBUG_BLOCKDEV 1
+// GPT Partition GUID for identifying system partitions
+#define ANDROID_SYSTEM_GUID \
+  { 0x38f428e6, 0xd326, 0x425d, { 0x9a, 0x40, 0x13, 0xdb, 0x74, 0x5c, 0x66, 0x4a } }
 
-#if DEBUG_BLOCKDEV
-#define BLOCKDEV_DEBUG(x) DEBUG(x)
-#else
-#define BLOCKDEV_DEBUG(x)
-#endif
+// GPT Partition GUID for identifying userdata partitions
+#define ANDROID_USERDATA_GUID \
+  { 0x57f8ee2e, 0x4c7c, 0x45dc, { 0x97, 0x59, 0xe8, 0x04, 0xd6, 0x95, 0x0e, 0x88 } }
 
-// Constants for partition scanning
-#define GPT_SIGNATURE            0x5452415020494645ULL // "EFI PART"
-#define GPT_HEADER_REVISION      0x00010000
-#define GPT_MAX_PARTITIONS       128
-#define MBR_SIGNATURE            0xAA55
-#define KNOWN_PARTITION_TYPES    10
+// GPT Partition GUID for identifying boot partitions
+#define ANDROID_BOOT_GUID \
+  { 0x20117f86, 0xe985, 0x4357, { 0xb9, 0xee, 0x37, 0x4b, 0xc5, 0x4d, 0x55, 0xaa } }
 
-// Common partition type GUIDs
-STATIC CONST EFI_GUID gEfiPartTypeSystemPartitionGuid = {
-  0xC12A7328, 0xF81F, 0x11D2, {0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B}
-};
+// GPT Partition GUID for identifying vendor partitions
+#define ANDROID_VENDOR_GUID \
+  { 0x84b1df1e, 0x111e, 0x4d4d, { 0xba, 0x5a, 0x33, 0xd7, 0x9a, 0x5a, 0x9d, 0xde } }
 
-STATIC CONST EFI_GUID gEfiPartTypeLegacyMbrGuid = {
-  0x024DEE41, 0x33E7, 0x11D3, {0x9D, 0x69, 0x00, 0x08, 0xC7, 0x81, 0xF3, 0x9F}
-};
+// GPT Partition GUID for identifying recovery partitions
+#define ANDROID_RECOVERY_GUID \
+  { 0x7a7ba616, 0xf12c, 0x4b94, { 0x82, 0x20, 0xd3, 0x5d, 0x04, 0xa9, 0x32, 0x9e } }
 
-// Known partition types commonly found on mobile devices
-STATIC CONST EFI_GUID gKnownPartitionTypes[KNOWN_PARTITION_TYPES] = {
-  // EFI System partition
-  {0xC12A7328, 0xF81F, 0x11D2, {0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B}},
-  // Basic data partition
-  {0xEBD0A0A2, 0xB9E5, 0x4433, {0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7}},
-  // Linux filesystem data
-  {0x0FC63DAF, 0x8483, 0x4772, {0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47, 0x7D, 0xE4}},
-  // Linux swap
-  {0x0657FD6D, 0xA4AB, 0x43C4, {0x84, 0xE5, 0x09, 0x33, 0xC8, 0x4B, 0x4F, 0x4F}},
-  // Android bootloader
-  {0x2568845D, 0x2332, 0x4675, {0xBC, 0x39, 0x8F, 0xA5, 0xA4, 0x74, 0x8D, 0x15}},
-  // Android boot
-  {0x49A4D17F, 0x93A3, 0x45C1, {0xA0, 0xDE, 0xF5, 0x0B, 0xA6, 0x14, 0x2E, 0xF8}},
-  // Android recovery
-  {0x4177C722, 0x9E92, 0x4AAB, {0x86, 0x99, 0xF5, 0x12, 0xEE, 0xC0, 0x9F, 0xBD}},
-  // Android system
-  {0x83BD6B9D, 0x7F4A, 0x11E0, {0xAC, 0xC0, 0x07, 0x00, 0x86, 0x02, 0xEE, 0x7D}},
-  // Android userdata
-  {0x8F68CC74, 0xC5E5, 0x48DA, {0xBE, 0x91, 0xA0, 0xC8, 0x15, 0x76, 0x21, 0x3F}},
-  // Android metadata
-  {0x20AC26BE, 0x20B7, 0x11E3, {0x84, 0xC5, 0x6C, 0xFB, 0x7F, 0xCF, 0x0B, 0x23}}
-};
+// UFS device model names for different Exynos devices
+#define UFS_DEVICE_EXYNOS990 L"Samsung Exynos 990 UFS"
+#define UFS_DEVICE_EXYNOS980 L"Samsung Exynos 980 UFS"
 
-// Structure to store partition information
+// MediaId values for different partitions
+#define MEDIA_ID_UFS        0
+#define MEDIA_ID_PARTITION  1
+
 typedef struct {
-  EFI_LBA                  StartingLBA;
-  EFI_LBA                  EndingLBA;
-  EFI_GUID                 PartitionTypeGUID;
-  EFI_GUID                 UniquePartitionGUID;
-  CHAR16                   PartitionName[36];
-  BOOLEAN                  IsValid;
+  VENDOR_DEVICE_PATH                  Vendor;
+  EFI_DEVICE_PATH_PROTOCOL            End;
+} BLOCK_DEVICE_DEVICE_PATH;
+
+STATIC BLOCK_DEVICE_DEVICE_PATH mDevicePath = {
+  {
+    {
+      HARDWARE_DEVICE_PATH,
+      HW_VENDOR_DP,
+      {
+        (UINT8)(sizeof(VENDOR_DEVICE_PATH)),
+        (UINT8)((sizeof(VENDOR_DEVICE_PATH)) >> 8),
+      },
+    },
+    EFI_CALLER_ID_GUID,
+  },
+  {
+    END_DEVICE_PATH_TYPE,
+    END_ENTIRE_DEVICE_PATH_SUBTYPE,
+    {
+      sizeof(EFI_DEVICE_PATH_PROTOCOL),
+      0
+    }
+  }
+};
+
+// Enhanced structure for handling partition information
+typedef struct {
+  UINT64                    StartLBA;
+  UINT64                    EndLBA;
+  CHAR16                    Name[36];
+  EFI_GUID                  TypeGUID;
+  EFI_GUID                  UniqueGUID;
+  BOOLEAN                   IsActive;
+} DETECTED_PARTITION;
+
+// Master Block Device structure
+typedef struct {
+  UINTN                       Signature;
+  EFI_HANDLE                  Handle;
+  BOOLEAN                     Initialized;
+  EFI_BLOCK_IO_PROTOCOL       BlockIo;
+  EFI_BLOCK_IO_MEDIA          Media;
+  BLOCK_DEVICE_DEVICE_PATH    DevicePath;
+  UINTN                       BlockSize;
+  UINTN                       NumBlocks;
+  // Fields for managing partitions
+  DETECTED_PARTITION          *Partitions;
+  UINTN                       PartitionCount;
+} BLOCK_DEVICE;
+
+#define BLOCK_DEVICE_SIGNATURE                 SIGNATURE_32('b', 'l', 'k', 'd')
+#define BLOCK_DEVICE_FROM_BLOCK_IO_THIS(a)     CR(a, BLOCK_DEVICE, BlockIo, BLOCK_DEVICE_SIGNATURE)
+
+// Partition device structure
+typedef struct {
+  UINTN                       Signature;
+  EFI_HANDLE                  Handle;
+  EFI_BLOCK_IO_PROTOCOL       BlockIo;
+  EFI_BLOCK_IO_MEDIA          Media;
+  EFI_DEVICE_PATH_PROTOCOL    *DevicePath;
+  BLOCK_DEVICE                *Parent;
+  UINT64                      StartLBA;
+  UINT64                      LastLBA;
+  CHAR16                      *PartitionName;
+} PARTITION_DEVICE;
+
+#define PARTITION_DEVICE_SIGNATURE             SIGNATURE_32('p', 'a', 'r', 't')
+#define PARTITION_DEVICE_FROM_BLOCK_IO_THIS(a) CR(a, PARTITION_DEVICE, BlockIo, PARTITION_DEVICE_SIGNATURE)
+
+// GPT Header definition
+typedef struct {
+  CHAR8     Signature[8];
+  UINT32    Revision;
+  UINT32    HeaderSize;
+  UINT32    HeaderCRC32;
+  UINT32    Reserved;
+  UINT64    MyLBA;
+  UINT64    AlternateLBA;
+  UINT64    FirstUsableLBA;
+  UINT64    LastUsableLBA;
+  EFI_GUID  DiskGUID;
+  UINT64    PartitionEntryLBA;
+  UINT32    NumberOfPartitionEntries;
+  UINT32    SizeOfPartitionEntry;
+  UINT32    PartitionEntryArrayCRC32;
+} GPT_HEADER;
+
+// GPT Partition Entry definition
+typedef struct {
+  EFI_GUID  PartitionTypeGUID;
+  EFI_GUID  UniquePartitionGUID;
+  UINT64    StartingLBA;
+  UINT64    EndingLBA;
+  UINT64    Attributes;
+  CHAR16    PartitionName[36];
 } GPT_PARTITION_ENTRY;
 
-// Additional MBR partition types commonly used on mobile devices
-#define MBR_TYPE_EFI_SYSTEM      0xEF
-#define MBR_TYPE_LINUX           0x83
-#define MBR_TYPE_LINUX_LVM       0x8E
-#define MBR_TYPE_LINUX_SWAP      0x82
-#define MBR_TYPE_ANDROID_BOOT    0x72
-#define MBR_TYPE_ANDROID_SYSTEM  0x74
-#define MBR_TYPE_ANDROID_DATA    0x78
-#define MBR_TYPE_ANDROID_CACHE   0x76
-
-// Forward declarations
-STATIC
-EFI_STATUS
-EFIAPI
-BlockDeviceDriverSupported (
-  IN EFI_DRIVER_BINDING_PROTOCOL *This,
-  IN EFI_HANDLE                  ControllerHandle,
-  IN EFI_DEVICE_PATH_PROTOCOL    *RemainingDevicePath OPTIONAL
-  );
-
-STATIC
-EFI_STATUS
-EFIAPI
-BlockDeviceDriverStart (
-  IN EFI_DRIVER_BINDING_PROTOCOL *This,
-  IN EFI_HANDLE                  ControllerHandle,
-  IN EFI_DEVICE_PATH_PROTOCOL    *RemainingDevicePath OPTIONAL
-  );
-
-STATIC
-EFI_STATUS
-EFIAPI
-BlockDeviceDriverStop (
-  IN  EFI_DRIVER_BINDING_PROTOCOL *This,
-  IN  EFI_HANDLE                  ControllerHandle,
-  IN  UINTN                       NumberOfChildren,
-  IN  EFI_HANDLE                  *ChildHandleBuffer
-  );
-
-// Block I/O Protocol function declarations
-STATIC
-EFI_STATUS
-EFIAPI
-BlockIoReset (
+// Function Prototypes
+STATIC EFI_STATUS EFIAPI BlockIoReset (
   IN EFI_BLOCK_IO_PROTOCOL *This,
   IN BOOLEAN               ExtendedVerification
   );
 
-STATIC
-EFI_STATUS
-EFIAPI
-BlockIoReadBlocks (
-  IN  EFI_BLOCK_IO_PROTOCOL *This,
-  IN  UINT32                MediaId,
-  IN  EFI_LBA               LBA,
-  IN  UINTN                 BufferSize,
-  OUT VOID                  *Buffer
+STATIC EFI_STATUS EFIAPI BlockIoReadBlocks (
+  IN EFI_BLOCK_IO_PROTOCOL *This,
+  IN UINT32                MediaId,
+  IN EFI_LBA               LBA,
+  IN UINTN                 BufferSize,
+  OUT VOID                 *Buffer
   );
 
-STATIC
-EFI_STATUS
-EFIAPI
-BlockIoWriteBlocks (
+STATIC EFI_STATUS EFIAPI BlockIoWriteBlocks (
   IN EFI_BLOCK_IO_PROTOCOL *This,
   IN UINT32                MediaId,
   IN EFI_LBA               LBA,
@@ -153,1457 +170,490 @@ BlockIoWriteBlocks (
   IN VOID                  *Buffer
   );
 
-STATIC
-EFI_STATUS
-EFIAPI
-BlockIoFlushBlocks (
+STATIC EFI_STATUS EFIAPI BlockIoFlushBlocks (
   IN EFI_BLOCK_IO_PROTOCOL *This
   );
 
-// Block I/O Protocol instance
-STATIC EFI_BLOCK_IO_PROTOCOL mBlockIoProtocol = {
-  EFI_BLOCK_IO_PROTOCOL_REVISION,
-  (EFI_BLOCK_IO_MEDIA *) 0,
-  BlockIoReset,
-  BlockIoReadBlocks,
-  BlockIoWriteBlocks,
-  BlockIoFlushBlocks
-};
-
-// Driver Binding Protocol instance
-STATIC EFI_DRIVER_BINDING_PROTOCOL mDriverBinding = {
-  BlockDeviceDriverSupported,
-  BlockDeviceDriverStart,
-  BlockDeviceDriverStop,
-  0x10, // Version
-  NULL, // ImageHandle
-  NULL  // DriverBindingHandle
-};
-
-/**
-  Read GPT header and validate it.
-
-  @param  BlockIo              BlockIo interface.
-  @param  GptHeader            Buffer to store GPT header.
-
-  @retval EFI_SUCCESS          GPT header read and validated.
-  @retval EFI_DEVICE_ERROR     Error reading from the device.
-  @retval EFI_CRC_ERROR        CRC check failure.
-  @retval EFI_INVALID_PARAMETER Invalid parameters.
-**/
-STATIC
-EFI_STATUS
-ReadGptHeader (
-  IN  EFI_BLOCK_IO_PROTOCOL   *BlockIo,
-  OUT EFI_PARTITION_TABLE_HEADER *GptHeader
-  )
-{
-  EFI_STATUS                  Status;
-  UINT32                      BlockSize;
-  UINT32                      MediaId;
-  EFI_CRC32_SERVICE_PROTOCOL  *Crc32;
-  UINT32                      CrcCalc;
-  UINT32                      CrcLength;
-  UINT32                      CrcOriginal;
-
-  if (BlockIo == NULL || GptHeader == NULL) {
-    return EFI_INVALID_PARAMETER;
-  }
-
-  BlockSize = BlockIo->Media->BlockSize;
-  MediaId   = BlockIo->Media->MediaId;
-
-  // Read the primary GPT header (LBA 1)
-  Status = BlockIo->ReadBlocks (
-                      BlockIo,
-                      MediaId,
-                      1,
-                      BlockSize,
-                      GptHeader
-                      );
-  if (EFI_ERROR (Status)) {
-    BLOCKDEV_DEBUG ((DEBUG_ERROR, "ReadGptHeader: Error reading GPT header: %r\n", Status));
-    return Status;
-  }
-
-  // Check GPT signature
-  if (GptHeader->Header.Signature != GPT_SIGNATURE) {
-    BLOCKDEV_DEBUG ((DEBUG_ERROR, "ReadGptHeader: Invalid GPT signature\n"));
-    return EFI_DEVICE_ERROR;
-  }
-
-  // Check revision
-  if (GptHeader->Header.Revision != GPT_HEADER_REVISION) {
-    BLOCKDEV_DEBUG ((DEBUG_ERROR, "ReadGptHeader: Unsupported GPT revision\n"));
-    return EFI_DEVICE_ERROR;
-  }
-
-  // Check header size
-  if (GptHeader->Header.HeaderSize < sizeof (EFI_PARTITION_TABLE_HEADER) ||
-      GptHeader->Header.HeaderSize > BlockSize) {
-    BLOCKDEV_DEBUG ((DEBUG_ERROR, "ReadGptHeader: Invalid header size\n"));
-    return EFI_DEVICE_ERROR;
-  }
-
-  // Verify the CRC
-  CrcLength = GptHeader->Header.HeaderSize;
-  CrcOriginal = GptHeader->Header.CRC32;
-  GptHeader->Header.CRC32 = 0;
-
-  Status = gBS->LocateProtocol (&gEfiCrc32ServiceProtocolGuid, NULL, (VOID **)&Crc32);
-  if (EFI_ERROR (Status)) {
-    BLOCKDEV_DEBUG ((DEBUG_ERROR, "ReadGptHeader: Could not locate CRC32 service: %r\n", Status));
-    GptHeader->Header.CRC32 = CrcOriginal;
-    return Status;
-  }
-
-  Status = Crc32->CalculateCrc32 (GptHeader, CrcLength, &CrcCalc);
-  GptHeader->Header.CRC32 = CrcOriginal;
+// UFS device detection and initialization
+STATIC EFI_STATUS InitializeUfsDevice(BLOCK_DEVICE *Dev) {
+  EFI_STATUS Status;
   
-  if (EFI_ERROR (Status)) {
-    BLOCKDEV_DEBUG ((DEBUG_ERROR, "ReadGptHeader: CRC calculation failed: %r\n", Status));
+  DEBUG((EFI_D_INFO, "BlockDeviceDxe: Initializing UFS device\n"));
+  
+  // Set up initial values for UFS device
+  Dev->BlockSize = 4096;  // Most UFS devices use 4KB blocks
+  Dev->NumBlocks = 0x1000000;  // Placeholder, will be updated later
+  
+  // Set up media information
+  Dev->Media.MediaId = MEDIA_ID_UFS;
+  Dev->Media.RemovableMedia = FALSE;
+  Dev->Media.MediaPresent = TRUE;
+  Dev->Media.LogicalPartition = FALSE;
+  Dev->Media.ReadOnly = FALSE;
+  Dev->Media.WriteCaching = FALSE;
+  Dev->Media.BlockSize = Dev->BlockSize;
+  Dev->Media.IoAlign = 0;
+  Dev->Media.LastBlock = Dev->NumBlocks - 1;
+  
+  // Initialize partition array
+  Dev->Partitions = NULL;
+  Dev->PartitionCount = 0;
+  
+  // Try to detect GPT on the device
+  Status = DetectGptPartitions(Dev);
+  if (EFI_ERROR(Status)) {
+    DEBUG((EFI_D_ERROR, "BlockDeviceDxe: GPT detection failed: %r\n", Status));
     return Status;
   }
-
-  if (CrcCalc != CrcOriginal) {
-    BLOCKDEV_DEBUG ((DEBUG_ERROR, "ReadGptHeader: CRC check failed\n"));
-    return EFI_CRC_ERROR;
-  }
-
+  
+  Dev->Initialized = TRUE;
   return EFI_SUCCESS;
 }
 
-/**
-  Read GPT partition entries.
-
-  @param  BlockIo              BlockIo interface.
-  @param  GptHeader            GPT header structure.
-  @param  PartEntries          Buffer to store partition entries.
-
-  @retval EFI_SUCCESS          Partition entries read.
-  @retval EFI_DEVICE_ERROR     Error reading from the device.
-  @retval EFI_CRC_ERROR        CRC check failure.
-  @retval EFI_INVALID_PARAMETER Invalid parameters.
-**/
-STATIC
-EFI_STATUS
-ReadGptPartitionEntries (
-  IN  EFI_BLOCK_IO_PROTOCOL        *BlockIo,
-  IN  EFI_PARTITION_TABLE_HEADER   *GptHeader,
-  OUT EFI_PARTITION_ENTRY          *PartEntries
-  )
-{
-  EFI_STATUS                  Status;
-  UINTN                       EntriesSize;
-  EFI_LBA                     StartLBA;
-  UINT32                      MediaId;
-  UINT32                      BlockSize;
-  EFI_CRC32_SERVICE_PROTOCOL  *Crc32;
-  UINT32                      CrcCalc;
-
-  if (BlockIo == NULL || GptHeader == NULL || PartEntries == NULL) {
-    return EFI_INVALID_PARAMETER;
-  }
-
-  MediaId   = BlockIo->Media->MediaId;
-  BlockSize = BlockIo->Media->BlockSize;
-  StartLBA  = GptHeader->PartitionEntryLBA;
-  EntriesSize = GptHeader->NumberOfPartitionEntries * GptHeader->SizeOfPartitionEntry;
-
-  // Calculate needed blocks to read
-  UINTN BlocksToRead = (EntriesSize + BlockSize - 1) / BlockSize;
+// Function to parse GPT headers and entries
+STATIC EFI_STATUS DetectGptPartitions(BLOCK_DEVICE *Dev) {
+  EFI_STATUS Status;
+  GPT_HEADER GptHeader;
+  GPT_PARTITION_ENTRY *PartitionEntries = NULL;
+  UINTN PartitionEntriesSize;
+  UINT8 *Buffer;
+  UINTN i;
   
-  // Read the partition entries
-  Status = BlockIo->ReadBlocks (
-                      BlockIo,
-                      MediaId,
-                      StartLBA,
-                      BlocksToRead * BlockSize,
-                      PartEntries
-                      );
-  if (EFI_ERROR (Status)) {
-    BLOCKDEV_DEBUG ((DEBUG_ERROR, "ReadGptPartitionEntries: Error reading partition entries: %r\n", Status));
-    return Status;
-  }
-
-  // Verify the CRC
-  Status = gBS->LocateProtocol (&gEfiCrc32ServiceProtocolGuid, NULL, (VOID **)&Crc32);
-  if (EFI_ERROR (Status)) {
-    BLOCKDEV_DEBUG ((DEBUG_ERROR, "ReadGptPartitionEntries: Could not locate CRC32 service: %r\n", Status));
-    return Status;
-  }
-
-  Status = Crc32->CalculateCrc32 (PartEntries, EntriesSize, &CrcCalc);
-  if (EFI_ERROR (Status)) {
-    BLOCKDEV_DEBUG ((DEBUG_ERROR, "ReadGptPartitionEntries: CRC calculation failed: %r\n", Status));
-    return Status;
-  }
-
-  if (CrcCalc != GptHeader->PartitionEntryArrayCRC32) {
-    BLOCKDEV_DEBUG ((DEBUG_ERROR, "ReadGptPartitionEntries: CRC check failed\n"));
-    return EFI_CRC_ERROR;
-  }
-
-  return EFI_SUCCESS;
-}
-
-/**
-  Detect and process MBR partition table.
-
-  @param  BlockIo              BlockIo interface.
-  @param  ParentDevicePath     Device path of the parent device.
-  @param  BlockIoDevice        Block device info structure.
-
-  @retval EFI_SUCCESS          MBR detected and processed.
-  @retval Others               Error occurred during detection.
-**/
-STATIC
-EFI_STATUS
-DetectMbrPartitions (
-  IN  EFI_BLOCK_IO_PROTOCOL     *BlockIo,
-  IN  EFI_DEVICE_PATH_PROTOCOL  *ParentDevicePath,
-  IN  BLOCK_IO_DEVICE           *BlockIoDevice
-  )
-{
-  EFI_STATUS              Status;
-  MASTER_BOOT_RECORD      *Mbr;
-  UINT32                  BlockSize;
-  UINT32                  MediaId;
-  UINT8                   PartCount;
-  EFI_PARTITION_ENTRY     *PartEntry;
-  EFI_DEVICE_PATH_PROTOCOL *DevicePath;
-  EFI_HANDLE              PartitionHandle;
-  UINT8                   Index;
-
-  BlockSize = BlockIo->Media->BlockSize;
-  MediaId   = BlockIo->Media->MediaId;
-
-  // Allocate buffer for MBR
-  Mbr = AllocatePool (BlockSize);
-  if (Mbr == NULL) {
+  DEBUG((EFI_D_INFO, "BlockDeviceDxe: Detecting GPT partitions\n"));
+  
+  // Read LBA 1 which should contain the GPT header
+  Buffer = AllocatePool(Dev->BlockSize);
+  if (Buffer == NULL) {
     return EFI_OUT_OF_RESOURCES;
   }
-
-  // Read MBR
-  Status = BlockIo->ReadBlocks (
-                      BlockIo,
-                      MediaId,
-                      0,
-                      BlockSize,
-                      Mbr
-                      );
-  if (EFI_ERROR (Status)) {
-    BLOCKDEV_DEBUG ((DEBUG_ERROR, "DetectMbrPartitions: Error reading MBR: %r\n", Status));
-    FreePool (Mbr);
+  
+  Status = Dev->BlockIo.ReadBlocks(&Dev->BlockIo, Dev->Media.MediaId, 1, Dev->BlockSize, Buffer);
+  if (EFI_ERROR(Status)) {
+    DEBUG((EFI_D_ERROR, "BlockDeviceDxe: Failed to read GPT header: %r\n", Status));
+    FreePool(Buffer);
     return Status;
   }
-
-  // Check MBR signature
-  if (Mbr->Signature != MBR_SIGNATURE) {
-    BLOCKDEV_DEBUG ((DEBUG_ERROR, "DetectMbrPartitions: Invalid MBR signature\n"));
-    FreePool (Mbr);
+  
+  // Copy and validate GPT header
+  CopyMem(&GptHeader, Buffer, sizeof(GPT_HEADER));
+  FreePool(Buffer);
+  
+  if (CompareMem(GptHeader.Signature, "EFI PART", 8) != 0) {
+    DEBUG((EFI_D_ERROR, "BlockDeviceDxe: Invalid GPT signature\n"));
     return EFI_DEVICE_ERROR;
   }
+  
+  DEBUG((EFI_D_INFO, "BlockDeviceDxe: Valid GPT header found\n"));
+  DEBUG((EFI_D_INFO, "BlockDeviceDxe: Number of partition entries: %d\n", GptHeader.NumberOfPartitionEntries));
+  
+  // Allocate memory for partition entries
+  PartitionEntriesSize = GptHeader.NumberOfPartitionEntries * GptHeader.SizeOfPartitionEntry;
+  PartitionEntries = AllocatePool(PartitionEntriesSize);
+  if (PartitionEntries == NULL) {
+    return EFI_OUT_OF_RESOURCES;
+  }
+  
+  // Read the partition entries
+  Buffer = (UINT8*)PartitionEntries;
+  for (i = 0; i < (PartitionEntriesSize + Dev->BlockSize - 1) / Dev->BlockSize; i++) {
+    Status = Dev->BlockIo.ReadBlocks(
+              &Dev->BlockIo,
+              Dev->Media.MediaId,
+              GptHeader.PartitionEntryLBA + i,
+              Dev->BlockSize,
+              Buffer + (i * Dev->BlockSize)
+            );
+    if (EFI_ERROR(Status)) {
+      DEBUG((EFI_D_ERROR, "BlockDeviceDxe: Failed to read partition entries: %r\n", Status));
+      FreePool(PartitionEntries);
+      return Status;
+    }
+  }
+  
+  // Count valid partitions (non-zero type GUID)
+  UINTN ValidPartitions = 0;
+  EFI_GUID EmptyGuid = {0};
+  
+  for (i = 0; i < GptHeader.NumberOfPartitionEntries; i++) {
+    if (CompareMem(&PartitionEntries[i].PartitionTypeGUID, &EmptyGuid, sizeof(EFI_GUID)) != 0) {
+      ValidPartitions++;
+    }
+  }
+  
+  DEBUG((EFI_D_INFO, "BlockDeviceDxe: Valid partitions found: %d\n", ValidPartitions));
+  
+  if (ValidPartitions == 0) {
+    FreePool(PartitionEntries);
+    return EFI_NOT_FOUND;
+  }
+  
+  // Allocate array for detected partitions
+  Dev->Partitions = AllocateZeroPool(ValidPartitions * sizeof(DETECTED_PARTITION));
+  if (Dev->Partitions == NULL) {
+    FreePool(PartitionEntries);
+    return EFI_OUT_OF_RESOURCES;
+  }
+  
+  // Fill in partition information
+  Dev->PartitionCount = 0;
+  for (i = 0; i < GptHeader.NumberOfPartitionEntries; i++) {
+    if (CompareMem(&PartitionEntries[i].PartitionTypeGUID, &EmptyGuid, sizeof(EFI_GUID)) != 0) {
+      Dev->Partitions[Dev->PartitionCount].StartLBA = PartitionEntries[i].StartingLBA;
+      Dev->Partitions[Dev->PartitionCount].EndLBA = PartitionEntries[i].EndingLBA;
+      CopyMem(&Dev->Partitions[Dev->PartitionCount].Name, 
+              &PartitionEntries[i].PartitionName, 
+              sizeof(PartitionEntries[i].PartitionName));
+      CopyMem(&Dev->Partitions[Dev->PartitionCount].TypeGUID, 
+              &PartitionEntries[i].PartitionTypeGUID, 
+              sizeof(EFI_GUID));
+      CopyMem(&Dev->Partitions[Dev->PartitionCount].UniqueGUID, 
+              &PartitionEntries[i].UniquePartitionGUID, 
+              sizeof(EFI_GUID));
+      Dev->Partitions[Dev->PartitionCount].IsActive = TRUE;
+      
+      DEBUG((EFI_D_INFO, "BlockDeviceDxe: Partition %d: %s (LBA %lx-%lx)\n", 
+             Dev->PartitionCount,
+             Dev->Partitions[Dev->PartitionCount].Name,
+             Dev->Partitions[Dev->PartitionCount].StartLBA,
+             Dev->Partitions[Dev->PartitionCount].EndLBA));
+      
+      Dev->PartitionCount++;
+    }
+  }
+  
+  FreePool(PartitionEntries);
+  return EFI_SUCCESS;
+}
 
-  // Process each partition entry
-  PartCount = 0;
-  for (Index = 0; Index < 4; Index++) {
-    PartEntry = &Mbr->Partition[Index];
+// Create device paths and install protocols for individual partitions
+STATIC EFI_STATUS CreatePartitionDevices(BLOCK_DEVICE *Dev) {
+  EFI_STATUS Status;
+  UINTN i;
+  PARTITION_DEVICE *PartitionDev;
+  UINTN PartitionNameSize;
+  UINTN HandleCount;
+  EFI_HANDLE *HandleBuffer;
+  
+  DEBUG((EFI_D_INFO, "BlockDeviceDxe: Creating partition devices, count: %d\n", Dev->PartitionCount));
+  
+  // First, check if partition devices are already installed
+  Status = gBS->LocateHandleBuffer(
+                 ByProtocol,
+                 &gEfiBlockIoProtocolGuid,
+                 NULL,
+                 &HandleCount,
+                 &HandleBuffer
+               );
+  
+  if (!EFI_ERROR(Status)) {
+    // Free the handle buffer as we don't need it
+    FreePool(HandleBuffer);
+  }
+  
+  for (i = 0; i < Dev->PartitionCount; i++) {
+    // Skip inactive partitions
+    if (!Dev->Partitions[i].IsActive) {
+      continue;
+    }
     
-    // Skip empty partitions
-    if (PartEntry->OSIndicator == 0x00) {
-      continue;
-    }
-
-    // Process protective MBR for GPT
-    if (PartEntry->OSIndicator == 0xEE) {
-      BLOCKDEV_DEBUG ((DEBUG_INFO, "DetectMbrPartitions: Protective MBR for GPT detected\n"));
-      FreePool (Mbr);
-      return EFI_NOT_FOUND; // Return to let GPT handler process the disk
-    }
-
-    // Process extended partitions (not implemented for simplicity)
-    if (PartEntry->OSIndicator == 0x05 || PartEntry->OSIndicator == 0x0F) {
-      BLOCKDEV_DEBUG ((DEBUG_INFO, "DetectMbrPartitions: Extended partition detected (not supported yet)\n"));
-      continue;
-    }
-
-    // Create a child BlockIo device for this partition
-    BLOCK_IO_DEVICE *PartitionDevice;
-    PartitionDevice = AllocateZeroPool (sizeof (BLOCK_IO_DEVICE));
-    if (PartitionDevice == NULL) {
-      BLOCKDEV_DEBUG ((DEBUG_ERROR, "DetectMbrPartitions: Out of resources\n"));
-      FreePool (Mbr);
+    // Allocate and initialize the partition device
+    PartitionDev = AllocateZeroPool(sizeof(PARTITION_DEVICE));
+    if (PartitionDev == NULL) {
       return EFI_OUT_OF_RESOURCES;
     }
-
-    // Set up the partition device
-    CopyMem (PartitionDevice, BlockIoDevice, sizeof (BLOCK_IO_DEVICE));
-    PartitionDevice->Media.LastBlock = PartEntry->TotalSectors - 1;
-    PartitionDevice->Media.BlockSize = BlockSize;
-    PartitionDevice->Media.ReadOnly = BlockIo->Media->ReadOnly;
-    PartitionDevice->Media.LogicalPartition = TRUE;
-    PartitionDevice->Media.MediaId = MediaId;
-    PartitionDevice->StartingLBA = PartEntry->StartingSector;
-    PartitionDevice->ParentDevicePath = ParentDevicePath;
-
+    
+    PartitionDev->Signature = PARTITION_DEVICE_SIGNATURE;
+    PartitionDev->Parent = Dev;
+    PartitionDev->StartLBA = Dev->Partitions[i].StartLBA;
+    PartitionDev->LastLBA = Dev->Partitions[i].EndLBA;
+    
+    // Copy the BlockIo protocol
+    CopyMem(&PartitionDev->BlockIo, &Dev->BlockIo, sizeof(EFI_BLOCK_IO_PROTOCOL));
+    PartitionDev->BlockIo.Media = &PartitionDev->Media;
+    
+    // Set up media information for this partition
+    CopyMem(&PartitionDev->Media, &Dev->Media, sizeof(EFI_BLOCK_IO_MEDIA));
+    PartitionDev->Media.MediaId = MEDIA_ID_PARTITION;
+    PartitionDev->Media.LogicalPartition = TRUE;
+    PartitionDev->Media.LastBlock = PartitionDev->LastLBA - PartitionDev->StartLBA;
+    
+    // Create partition name
+    PartitionNameSize = StrSize(Dev->Partitions[i].Name);
+    PartitionDev->PartitionName = AllocateZeroPool(PartitionNameSize);
+    if (PartitionDev->PartitionName == NULL) {
+      FreePool(PartitionDev);
+      return EFI_OUT_OF_RESOURCES;
+    }
+    
+    CopyMem(PartitionDev->PartitionName, Dev->Partitions[i].Name, PartitionNameSize);
+    
     // Create device path for this partition
-    DevicePath = CreateDeviceNode (
-                   HARDWARE_DEVICE_PATH,
-                   HW_VENDOR_DP,
-                   (UINT16) sizeof (VENDOR_DEVICE_PATH)
-                   );
-    if (DevicePath == NULL) {
-      BLOCKDEV_DEBUG ((DEBUG_ERROR, "DetectMbrPartitions: Failed to create device path\n"));
-      FreePool (PartitionDevice);
-      continue;
+    PartitionDev->DevicePath = AppendDevicePathNode(
+                                 DevicePathFromHandle(Dev->Handle),
+                                 (EFI_DEVICE_PATH_PROTOCOL *)&mDevicePath.Vendor
+                               );
+    
+    if (PartitionDev->DevicePath == NULL) {
+      FreePool(PartitionDev->PartitionName);
+      FreePool(PartitionDev);
+      return EFI_OUT_OF_RESOURCES;
     }
-
-    // Set the partition GUID based on the partition type
-    VENDOR_DEVICE_PATH *VendorPath = (VENDOR_DEVICE_PATH *) DevicePath;
-    switch (PartEntry->OSIndicator) {
-      case MBR_TYPE_EFI_SYSTEM:
-        CopyGuid (&VendorPath->Guid, &gEfiPartTypeSystemPartitionGuid);
-        break;
-      case MBR_TYPE_LINUX:
-      case MBR_TYPE_LINUX_LVM:
-      case MBR_TYPE_LINUX_SWAP:
-      case MBR_TYPE_ANDROID_BOOT:
-      case MBR_TYPE_ANDROID_SYSTEM:
-      case MBR_TYPE_ANDROID_DATA:
-      case MBR_TYPE_ANDROID_CACHE:
-        // Create a unique GUID for each partition type
-        VendorPath->Guid.Data1 = PartEntry->OSIndicator;
-        VendorPath->Guid.Data2 = 0x1234;
-        VendorPath->Guid.Data3 = 0x5678;
-        VendorPath->Guid.Data4[0] = 0x99;
-        VendorPath->Guid.Data4[1] = 0x88;
-        VendorPath->Guid.Data4[2] = 0x77;
-        VendorPath->Guid.Data4[3] = 0x66;
-        VendorPath->Guid.Data4[4] = 0x55;
-        VendorPath->Guid.Data4[5] = 0x44;
-        VendorPath->Guid.Data4[6] = 0x33;
-        VendorPath->Guid.Data4[7] = 0x22;
-        break;
-      default:
-        CopyGuid (&VendorPath->Guid, &gEfiPartTypeLegacyMbrGuid);
-        break;
-    }
-
-    // Append to parent device path
-    PartitionDevice->DevicePath = AppendDevicePath (
-                                    ParentDevicePath,
-                                    DevicePath
-                                    );
-    FreePool (DevicePath);
-
-    if (PartitionDevice->DevicePath == NULL) {
-      BLOCKDEV_DEBUG ((DEBUG_ERROR, "DetectMbrPartitions: Failed to create full device path\n"));
-      FreePool (PartitionDevice);
-      continue;
-    }
-
+    
     // Install protocols
-    Status = gBS->InstallMultipleProtocolInterfaces (
-                    &PartitionHandle,
-                    &gEfiBlockIoProtocolGuid,
-                    &PartitionDevice->BlockIo,
-                    &gEfiDevicePathProtocolGuid,
-                    PartitionDevice->DevicePath,
-                    NULL
-                    );
-    if (EFI_ERROR (Status)) {
-      BLOCKDEV_DEBUG ((DEBUG_ERROR, "DetectMbrPartitions: Failed to install protocols: %r\n", Status));
-      FreePool (PartitionDevice->DevicePath);
-      FreePool (PartitionDevice);
-      continue;
+    Status = gBS->InstallMultipleProtocolInterfaces(
+                   &PartitionDev->Handle,
+                   &gEfiBlockIoProtocolGuid, &PartitionDev->BlockIo,
+                   &gEfiDevicePathProtocolGuid, PartitionDev->DevicePath,
+                   NULL
+                 );
+    
+    if (EFI_ERROR(Status)) {
+      DEBUG((EFI_D_ERROR, "BlockDeviceDxe: Failed to install protocols for partition %d: %r\n", i, Status));
+      FreePool(PartitionDev->PartitionName);
+      FreePool(PartitionDev->DevicePath);
+      FreePool(PartitionDev);
+      continue; // Try the next partition
     }
-
-    BLOCKDEV_DEBUG ((DEBUG_INFO, "DetectMbrPartitions: Installed MBR partition %d, type 0x%02x\n", 
-                    Index, PartEntry->OSIndicator));
-    PartCount++;
+    
+    DEBUG((EFI_D_INFO, "BlockDeviceDxe: Created partition device: %s\n", PartitionDev->PartitionName));
   }
-
-  BLOCKDEV_DEBUG ((DEBUG_INFO, "DetectMbrPartitions: Detected %d MBR partitions\n", PartCount));
-  FreePool (Mbr);
-  return PartCount > 0 ? EFI_SUCCESS : EFI_NOT_FOUND;
+  
+  return EFI_SUCCESS;
 }
 
-/**
-  Detect and process GPT partition table.
-
-  @param  BlockIo              BlockIo interface.
-  @param  ParentDevicePath     Device path of the parent device.
-  @param  BlockIoDevice        Block device info structure.
-
-  @retval EFI_SUCCESS          GPT detected and processed.
-  @retval Others               Error occurred during detection.
-**/
-STATIC
-EFI_STATUS
-DetectGptPartitions (
-  IN  EFI_BLOCK_IO_PROTOCOL     *BlockIo,
-  IN  EFI_DEVICE_PATH_PROTOCOL  *ParentDevicePath,
-  IN  BLOCK_IO_DEVICE           *BlockIoDevice
-  )
-{
-  EFI_STATUS                  Status;
-  EFI_PARTITION_TABLE_HEADER  *GptHeader;
-  EFI_PARTITION_ENTRY         *PartEntries;
-  UINT32                      BlockSize;
-  UINT32                      MediaId;
-  UINT32                      Index;
-  UINT32                      PartCount;
-  EFI_DEVICE_PATH_PROTOCOL    *DevicePath;
-  EFI_HANDLE                  PartitionHandle;
-  GPT_PARTITION_ENTRY         *PartInfo;
-
-  BlockSize = BlockIo->Media->BlockSize;
-  MediaId   = BlockIo->Media->MediaId;
-
-  // Allocate buffer for GPT header
-  GptHeader = AllocatePool (BlockSize);
-  if (GptHeader == NULL) {
-    return EFI_OUT_OF_RESOURCES;
-  }
-
-  // Read and validate the GPT header
-  Status = ReadGptHeader (BlockIo, GptHeader);
-  if (EFI_ERROR (Status)) {
-    BLOCKDEV_DEBUG ((DEBUG_ERROR, "DetectGptPartitions: GPT header validation failed: %r\n", Status));
-    
-    // Try alternative (backup) GPT header if primary fails
-    if (BlockIo->Media->LastBlock > 0) {
-      Status = BlockIo->ReadBlocks (
-                          BlockIo,
-                          MediaId,
-                          BlockIo->Media->LastBlock,
-                          BlockSize,
-                          GptHeader
-                          );
-      if (EFI_ERROR (Status)) {
-        BLOCKDEV_DEBUG ((DEBUG_ERROR, "DetectGptPartitions: Failed to read backup GPT header: %r\n", Status));
-        FreePool (GptHeader);
-        return Status;
-      }
-      
-      // Validate backup header
-      if (GptHeader->Header.Signature != GPT_SIGNATURE) {
-        BLOCKDEV_DEBUG ((DEBUG_ERROR, "DetectGptPartitions: Invalid backup GPT signature\n"));
-        FreePool (GptHeader);
-        return EFI_DEVICE_ERROR;
-      }
-    } else {
-      FreePool (GptHeader);
-      return Status;
-    }
-  }
-
-  // Allocate buffer for partition entries
-  UINTN EntriesSize = GptHeader->NumberOfPartitionEntries * GptHeader->SizeOfPartitionEntry;
-  PartEntries = AllocatePool (EntriesSize);
-  if (PartEntries == NULL) {
-    FreePool (GptHeader);
-    return EFI_OUT_OF_RESOURCES;
-  }
-
-  // Read the partition entries
-  Status = ReadGptPartitionEntries (BlockIo, GptHeader, PartEntries);
-  if (EFI_ERROR (Status)) {
-    BLOCKDEV_DEBUG ((DEBUG_ERROR, "DetectGptPartitions: Failed to read partition entries: %r\n", Status));
-    
-    // Try reading from backup if primary fails
-    if (BlockIo->Media->LastBlock > 0) {
-      EFI_LBA BackupEntryLBA = GptHeader->AlternateLBA - 
-                               (GptHeader->NumberOfPartitionEntries * GptHeader->SizeOfPartitionEntry + BlockSize - 1) / BlockSize;
-      
-      Status = BlockIo->ReadBlocks (
-                          BlockIo,
-                          MediaId,
-                          BackupEntryLBA,
-                          EntriesSize,
-                          PartEntries
-                          );
-      if (EFI_ERROR (Status)) {
-        BLOCKDEV_DEBUG ((DEBUG_ERROR, "DetectGptPartitions: Failed to read backup partition entries: %r\n", Status));
-        FreePool (PartEntries);
-        FreePool (GptHeader);
-        return Status;
-      }
-    } else {
-      FreePool (PartEntries);
-      FreePool (GptHeader);
-      return Status;
-    }
-  }
-
-  // Process valid partition entries
-  PartCount = 0;
-  PartInfo = AllocateZeroPool (sizeof (GPT_PARTITION_ENTRY) * GptHeader->NumberOfPartitionEntries);
-  if (PartInfo == NULL) {
-    FreePool (PartEntries);
-    FreePool (GptHeader);
-    return EFI_OUT_OF_RESOURCES;
-  }
-
-  // First pass: collect all partition information
-  for (Index = 0; Index < GptHeader->NumberOfPartitionEntries; Index++) {
-    EFI_PARTITION_ENTRY *Entry = (EFI_PARTITION_ENTRY *)((UINT8 *)PartEntries + Index * GptHeader->SizeOfPartitionEntry);
-    
-    // Check if this is an empty entry
-    if (CompareGuid (&Entry->PartitionTypeGUID, &gEfiPartTypeUnusedGuid)) {
-      continue;
-    }
-
-    // Store the partition information
-    PartInfo[PartCount].StartingLBA = Entry->StartingLBA;
-    PartInfo[PartCount].EndingLBA = Entry->EndingLBA;
-    CopyGuid (&PartInfo[PartCount].PartitionTypeGUID, &Entry->PartitionTypeGUID);
-    CopyGuid (&PartInfo[PartCount].UniquePartitionGUID, &Entry->UniquePartitionGUID);
-    
-    // Copy partition name (ensure proper null-termination)
-    CopyMem (PartInfo[PartCount].PartitionName, Entry->PartitionName, sizeof (Entry->PartitionName));
-    PartInfo[PartInfo[PartCount].IsValid = TRUE;
-
-    BLOCKDEV_DEBUG ((DEBUG_INFO, "DetectGptPartitions: Found partition %d: %s\n", 
-                     PartCount, PartInfo[PartCount].PartitionName));
-    PartCount++;
-  }
-
-  BLOCKDEV_DEBUG ((DEBUG_INFO, "DetectGptPartitions: Detected %d GPT partitions\n", PartCount));
-
-  // Second pass: create partition devices
-  for (Index = 0; Index < PartCount; Index++) {
-    if (!PartInfo[Index].IsValid) {
-      continue;
-    }
-
-    // Create a child BlockIo device for this partition
-    BLOCK_IO_DEVICE *PartitionDevice;
-    PartitionDevice = AllocateZeroPool (sizeof (BLOCK_IO_DEVICE));
-    if (PartitionDevice == NULL) {
-      BLOCKDEV_DEBUG ((DEBUG_ERROR, "DetectGptPartitions: Out of resources\n"));
-      continue;
-    }
-
-    // Set up the partition device
-    CopyMem (PartitionDevice, BlockIoDevice, sizeof (BLOCK_IO_DEVICE));
-    PartitionDevice->Media.LastBlock = PartInfo[Index].EndingLBA - PartInfo[Index].StartingLBA;
-    PartitionDevice->Media.BlockSize = BlockSize;
-    PartitionDevice->Media.ReadOnly = BlockIo->Media->ReadOnly;
-    PartitionDevice->Media.LogicalPartition = TRUE;
-    PartitionDevice->Media.MediaId = MediaId;
-    PartitionDevice->StartingLBA = PartInfo[Index].StartingLBA;
-    PartitionDevice->ParentDevicePath = ParentDevicePath;
-
-    // Create device path for this partition
-    DevicePath = CreateDeviceNode (
-                   MEDIA_DEVICE_PATH,
-                   MEDIA_HARDDRIVE_DP,
-                   (UINT16) sizeof (HARDDRIVE_DEVICE_PATH)
-                   );
-    if (DevicePath == NULL) {
-      BLOCKDEV_DEBUG ((DEBUG_ERROR, "DetectGptPartitions: Failed to create device path\n"));
-      FreePool (PartitionDevice);
-      continue;
-    }
-
-    // Set up the partition device path
-    HARDDRIVE_DEVICE_PATH *HardDrivePath = (HARDDRIVE_DEVICE_PATH *) DevicePath;
-    HardDrivePath->PartitionNumber = Index + 1;
-    HardDrivePath->PartitionStart = PartInfo[Index].StartingLBA;
-    HardDrivePath->PartitionSize = PartInfo[Index].EndingLBA - PartInfo[Index].StartingLBA + 1;
-    HardDrivePath->MBRType = MBR_TYPE_EFI_PARTITION_TABLE_HEADER;
-    HardDrivePath->SignatureType = SIGNATURE_TYPE_GUID;
-    CopyMem (HardDrivePath->Signature, &PartInfo[Index].UniquePartitionGUID, sizeof (EFI_GUID));
-
-    // Append to parent device path
-    PartitionDevice->DevicePath = AppendDevicePath (
-                                    ParentDevicePath,
-                                    DevicePath
-                                    );
-    FreePool (DevicePath);
-
-    if (PartitionDevice->DevicePath == NULL) {
-      BLOCKDEV_DEBUG ((DEBUG_ERROR, "DetectGptPartitions: Failed to create full device path\n"));
-      FreePool (PartitionDevice);
-      continue;
-    }
-
-    // Debug log the partition details
-    BLOCKDEV_DEBUG ((DEBUG_INFO, "DetectGptPartitions: Installing partition %d:\n", Index + 1));
-    BLOCKDEV_DEBUG ((DEBUG_INFO, "  Name: %s\n", PartInfo[Index].PartitionName));
-    BLOCKDEV_DEBUG ((DEBUG_INFO, "  Start LBA: 0x%lx, End LBA: 0x%lx\n", 
-                    PartInfo[Index].StartingLBA, PartInfo[Index].EndingLBA));
-    BLOCKDEV_DEBUG ((DEBUG_INFO, "  Type: %g\n", &PartInfo[Index].PartitionTypeGUID));
-    BLOCKDEV_DEBUG ((DEBUG_INFO, "  GUID: %g\n", &PartInfo[Index].UniquePartitionGUID));
-
-    // Install protocols
-    Status = gBS->InstallMultipleProtocolInterfaces (
-                    &PartitionHandle,
-                    &gEfiBlockIoProtocolGuid,
-                    &PartitionDevice->BlockIo,
-                    &gEfiDevicePathProtocolGuid,
-                    PartitionDevice->DevicePath,
-                    NULL
-                    );
-    if (EFI_ERROR (Status)) {
-      BLOCKDEV_DEBUG ((DEBUG_ERROR, "DetectGptPartitions: Failed to install protocols: %r\n", Status));
-      FreePool (PartitionDevice->DevicePath);
-      FreePool (PartitionDevice);
-      continue;
-    }
-  }
-
-  FreePool (PartInfo);
-  FreePool (PartEntries);
-  FreePool (GptHeader);
-  return PartCount > 0 ? EFI_SUCCESS : EFI_NOT_FOUND;
-}
-
-/**
-  Detect and handle partitions on the block device.
-
-  @param  BlockIo              BlockIo interface.
-  @param  DevicePath           Device path of the device.
-  @param  BlockIoDevice        Block device info structure.
-
-  @retval EFI_SUCCESS          Partitions detected and handled.
-  @retval Others               Error occurred during detection.
-**/
-STATIC
-EFI_STATUS
-DetectPartitions (
-  IN  EFI_BLOCK_IO_PROTOCOL     *BlockIo,
-  IN  EFI_DEVICE_PATH_PROTOCOL  *DevicePath,
-  IN  BLOCK_IO_DEVICE           *BlockIoDevice
-  )
-{
-  EFI_STATUS Status;
-
-  BLOCKDEV_DEBUG ((DEBUG_INFO, "DetectPartitions: Scanning for partitions...\n"));
-
-  // First try to detect GPT partitions
-  Status = DetectGptPartitions (BlockIo, DevicePath, BlockIoDevice);
-  if (!EFI_ERROR (Status)) {
-    BLOCKDEV_DEBUG ((DEBUG_INFO, "DetectPartitions: GPT partitions detected\n"));
-    return EFI_SUCCESS;
-  }
-
-  // Fall back to MBR partitions if GPT detection fails
-  Status = DetectMbrPartitions (BlockIo, DevicePath, BlockIoDevice);
-  if (!EFI_ERROR (Status)) {
-    BLOCKDEV_DEBUG ((DEBUG_INFO, "DetectPartitions: MBR partitions detected\n"));
-    return EFI_SUCCESS;
-  }
-
-  // No partitions detected
-  BLOCKDEV_DEBUG ((DEBUG_INFO, "DetectPartitions: No partitions detected\n"));
-  return EFI_NOT_FOUND;
-}
-
-/**
-  Reset the Block Device.
-
-  @param  This                 Block IO protocol instance.
-  @param  ExtendedVerification Indicates that the driver may perform a more
-                               exhaustive verification operation of the device.
-
-  @retval EFI_SUCCESS          The device was reset.
-  @retval EFI_DEVICE_ERROR     The device is not functioning properly.
-
-**/
-STATIC
-EFI_STATUS
-EFIAPI
-BlockIoReset (
+// Block I/O protocol function implementations
+STATIC EFI_STATUS EFIAPI BlockIoReset (
   IN EFI_BLOCK_IO_PROTOCOL *This,
   IN BOOLEAN               ExtendedVerification
   )
 {
-  BLOCK_IO_DEVICE    *BlockIoDevice;
-  
-  BlockIoDevice = BLOCK_IO_DEVICE_FROM_BLOCK_IO_THIS (This);
-  
-  if (BlockIoDevice->Media.LogicalPartition) {
-    // For logical partitions, forward the reset to the parent BlockIo
-    EFI_BLOCK_IO_PROTOCOL *ParentBlockIo;
-    EFI_STATUS Status;
-    
-    Status = gBS->HandleProtocol (
-                    BlockIoDevice->ControllerHandle,
-                    &gEfiBlockIoProtocolGuid,
-                    (VOID **) &ParentBlockIo
-                    );
-    if (EFI_ERROR (Status)) {
-      return Status;
-    }
-    
-    return ParentBlockIo->Reset (ParentBlockIo, ExtendedVerification);
-  }
-  
   return EFI_SUCCESS;
 }
 
-/**
-  Read BufferSize bytes from Lba into Buffer.
-
-  @param  This                 Protocol instance pointer.
-  @param  MediaId              Id of the media, changes every time the media is replaced.
-  @param  Lba                  The starting Logical Block Address to read from.
-  @param  BufferSize           Size of Buffer, must be a multiple of device block size.
-  @param  Buffer               A pointer to the destination buffer for the data.
-
-  @retval EFI_SUCCESS          The data was read correctly from the device.
-  @retval EFI_DEVICE_ERROR     The device reported an error while performing the read.
-  @retval EFI_NO_MEDIA         There is no media in the device.
-  @retval EFI_MEDIA_CHANGED    The MediaId does not match the current device.
-  @retval EFI_BAD_BUFFER_SIZE  The Buffer was not a multiple of the block size of the device.
-  @retval EFI_INVALID_PARAMETER The read request contains LBAs that are not valid,
-                               or the buffer is not properly aligned.
-
-**/
-STATIC
-EFI_STATUS
-EFIAPI
-BlockIoReadBlocks (
-  IN  EFI_BLOCK_IO_PROTOCOL *This,
-  IN  UINT32                MediaId,
-  IN  EFI_LBA               Lba,
-  IN  UINTN                 BufferSize,
-  OUT VOID                  *Buffer
+STATIC EFI_STATUS EFIAPI BlockIoReadBlocks (
+  IN EFI_BLOCK_IO_PROTOCOL *This,
+  IN UINT32                MediaId,
+  IN EFI_LBA               LBA,
+  IN UINTN                 BufferSize,
+  OUT VOID                 *Buffer
   )
 {
-  BLOCK_IO_DEVICE    *BlockIoDevice;
-  EFI_BLOCK_IO_PROTOCOL *ParentBlockIo;
-  EFI_STATUS         Status;
+  PARTITION_DEVICE *PartitionDev;
+  BLOCK_DEVICE *Dev;
+  EFI_LBA DeviceLBA;
   
   if (This == NULL || Buffer == NULL) {
     return EFI_INVALID_PARAMETER;
   }
   
-  BlockIoDevice = BLOCK_IO_DEVICE_FROM_BLOCK_IO_THIS (This);
-  
-  if (MediaId != BlockIoDevice->Media.MediaId) {
-    return EFI_MEDIA_CHANGED;
-  }
-  
-  if (BufferSize % BlockIoDevice->Media.BlockSize != 0) {
-    return EFI_BAD_BUFFER_SIZE;
-  }
-  
-  if (Lba > BlockIoDevice->Media.LastBlock) {
-    return EFI_INVALID_PARAMETER;
-  }
-
   if (BufferSize == 0) {
     return EFI_SUCCESS;
   }
-
-  // Calculate blocks to read
-  UINTN BlockCount = BufferSize / BlockIoDevice->Media.BlockSize;
   
-  // For logical partitions, adjust LBA and use parent BlockIo
-  if (BlockIoDevice->Media.LogicalPartition) {
-    Status = gBS->HandleProtocol (
-                    BlockIoDevice->ControllerHandle,
-                    &gEfiBlockIoProtocolGuid,
-                    (VOID **) &ParentBlockIo
-                    );
-    if (EFI_ERROR (Status)) {
-      return Status;
+  // Check if this is a request to the main block device or a partition
+  if (This->Media->MediaId == MEDIA_ID_UFS) {
+    Dev = BLOCK_DEVICE_FROM_BLOCK_IO_THIS(This);
+    
+    if (MediaId != Dev->Media.MediaId) {
+      return EFI_MEDIA_CHANGED;
     }
     
-    EFI_LBA ParentLba = Lba + BlockIoDevice->StartingLBA;
+    if (LBA > Dev->Media.LastBlock) {
+      return EFI_INVALID_PARAMETER;
+    }
     
-    return ParentBlockIo->ReadBlocks (
-                            ParentBlockIo,
-                            ParentBlockIo->Media->MediaId,
-                            ParentLba,
-                            BufferSize,
-                            Buffer
-                            );
+    if ((BufferSize % Dev->BlockSize) != 0) {
+      return EFI_BAD_BUFFER_SIZE;
+    }
+    
+    if (BufferSize > Dev->BlockSize * (Dev->Media.LastBlock - LBA + 1)) {
+      return EFI_INVALID_PARAMETER;
+    }
+    
+    // Perform the actual read operation for the main device
+    // This is a stub that would be implemented with actual UFS read operations
+    SetMem(Buffer, BufferSize, 0xAA); // Placeholder
+    return EFI_SUCCESS;
+  } else {
+    // This is a request to a partition
+    PartitionDev = PARTITION_DEVICE_FROM_BLOCK_IO_THIS(This);
+    
+    if (MediaId != PartitionDev->Media.MediaId) {
+      return EFI_MEDIA_CHANGED;
+    }
+    
+    if (LBA > PartitionDev->Media.LastBlock) {
+      return EFI_INVALID_PARAMETER;
+    }
+    
+    if ((BufferSize % PartitionDev->Parent->BlockSize) != 0) {
+      return EFI_BAD_BUFFER_SIZE;
+    }
+    
+    // Translate LBA from partition-relative to device-absolute
+    DeviceLBA = LBA + PartitionDev->StartLBA;
+    
+    // Forward the read request to the parent device
+    return PartitionDev->Parent->BlockIo.ReadBlocks(
+             &PartitionDev->Parent->BlockIo,
+             PartitionDev->Parent->Media.MediaId,
+             DeviceLBA,
+             BufferSize,
+             Buffer
+           );
   }
-  
-  // For physical devices, forward the request to the device-specific implementation
-  Status = BlockIoDevice->StorageDeviceReadBlocks (
-                            BlockIoDevice,
-                            MediaId,
-                            Lba,
-                            BufferSize,
-                            Buffer
-                            );
-  
-  return Status;
 }
 
-/**
-  Write BufferSize bytes from Lba into Buffer.
-
-  @param  This                 Protocol instance pointer.
-  @param  MediaId              The media ID that the write request is for.
-  @param  Lba                  The starting logical block address to be written.
-  @param  BufferSize           Size of Buffer, must be a multiple of device block size.
-  @param  Buffer               A pointer to the source buffer for the data.
-
-  @retval EFI_SUCCESS          The data was written correctly to the device.
-  @retval EFI_DEVICE_ERROR     The device reported an error while performing the write.
-  @retval EFI_NO_MEDIA         There is no media in the device.
-  @retval EFI_MEDIA_CHANGED    The MediaId does not match the current device.
-  @retval EFI_BAD_BUFFER_SIZE  The Buffer was not a multiple of the block size of the device.
-  @retval EFI_INVALID_PARAMETER The write request contains LBAs that are not valid,
-                               or the buffer is not properly aligned.
-
-**/
-STATIC
-EFI_STATUS
-EFIAPI
-BlockIoWriteBlocks (
+STATIC EFI_STATUS EFIAPI BlockIoWriteBlocks (
   IN EFI_BLOCK_IO_PROTOCOL *This,
   IN UINT32                MediaId,
-  IN EFI_LBA               Lba,
+  IN EFI_LBA               LBA,
   IN UINTN                 BufferSize,
   IN VOID                  *Buffer
   )
 {
-  BLOCK_IO_DEVICE    *BlockIoDevice;
-  EFI_BLOCK_IO_PROTOCOL *ParentBlockIo;
-  EFI_STATUS         Status;
+  PARTITION_DEVICE *PartitionDev;
+  BLOCK_DEVICE *Dev;
+  EFI_LBA DeviceLBA;
   
   if (This == NULL || Buffer == NULL) {
     return EFI_INVALID_PARAMETER;
   }
   
-  BlockIoDevice = BLOCK_IO_DEVICE_FROM_BLOCK_IO_THIS (This);
-  
-  if (MediaId != BlockIoDevice->Media.MediaId) {
-    return EFI_MEDIA_CHANGED;
-  }
-  
-  if (BufferSize % BlockIoDevice->Media.BlockSize != 0) {
-    return EFI_BAD_BUFFER_SIZE;
-  }
-  
-  if (Lba > BlockIoDevice->Media.LastBlock) {
-    return EFI_INVALID_PARAMETER;
-  }
-  
-  if (BlockIoDevice->Media.ReadOnly) {
-    return EFI_WRITE_PROTECTED;
-  }
-
   if (BufferSize == 0) {
     return EFI_SUCCESS;
   }
-
-  // For logical partitions, adjust LBA and use parent BlockIo
-  if (BlockIoDevice->Media.LogicalPartition) {
-    Status = gBS->HandleProtocol (
-                    BlockIoDevice->ControllerHandle,
-                    &gEfiBlockIoProtocolGuid,
-                    (VOID **) &ParentBlockIo
-                    );
-    if (EFI_ERROR (Status)) {
-      return Status;
+  
+  // Check if this is a request to the main block device or a partition
+  if (This->Media->MediaId == MEDIA_ID_UFS) {
+    Dev = BLOCK_DEVICE_FROM_BLOCK_IO_THIS(This);
+    
+    if (MediaId != Dev->Media.MediaId) {
+      return EFI_MEDIA_CHANGED;
     }
     
-    EFI_LBA ParentLba = Lba + BlockIoDevice->StartingLBA;
+    if (Dev->Media.ReadOnly) {
+      return EFI_WRITE_PROTECTED;
+    }
     
-    return ParentBlockIo->WriteBlocks (
-                             ParentBlockIo,
-                             ParentBlockIo->Media->MediaId,
-                             ParentLba,
-                             BufferSize,
-                             Buffer
-                             );
+    if (LBA > Dev->Media.LastBlock) {
+      return EFI_INVALID_PARAMETER;
+    }
+    
+    if ((BufferSize % Dev->BlockSize) != 0) {
+      return EFI_BAD_BUFFER_SIZE;
+    }
+    
+    if (BufferSize > Dev->BlockSize * (Dev->Media.LastBlock - LBA + 1)) {
+      return EFI_INVALID_PARAMETER;
+    }
+    
+    // Perform the actual write operation for the main device
+    // This is a stub that would be implemented with actual UFS write operations
+    return EFI_SUCCESS;
+  } else {
+    // This is a request to a partition
+    PartitionDev = PARTITION_DEVICE_FROM_BLOCK_IO_THIS(This);
+    
+    if (MediaId != PartitionDev->Media.MediaId) {
+      return EFI_MEDIA_CHANGED;
+    }
+    
+    if (PartitionDev->Media.ReadOnly) {
+      return EFI_WRITE_PROTECTED;
+    }
+    
+    if (LBA > PartitionDev->Media.LastBlock) {
+      return EFI_INVALID_PARAMETER;
+    }
+    
+    if ((BufferSize % PartitionDev->Parent->BlockSize) != 0) {
+      return EFI_BAD_BUFFER_SIZE;
+    }
+    
+    // Translate LBA from partition-relative to device-absolute
+    DeviceLBA = LBA + PartitionDev->StartLBA;
+    
+    // Forward the write request to the parent device
+    return PartitionDev->Parent->BlockIo.WriteBlocks(
+             &PartitionDev->Parent->BlockIo,
+             PartitionDev->Parent->Media.MediaId,
+             DeviceLBA,
+             BufferSize,
+             Buffer
+           );
   }
-  
-  // For physical devices, forward the request to the device-specific implementation
-  Status = BlockIoDevice->StorageDeviceWriteBlocks (
-                            BlockIoDevice,
-                            MediaId,
-                            Lba,
-                            BufferSize,
-                            Buffer
-                            );
-  
-  return Status;
 }
 
-/**
-  Flush the Block Device.
-
-  @param  This                 Protocol instance pointer.
-
-  @retval EFI_SUCCESS          All outstanding data was written to the device.
-  @retval EFI_DEVICE_ERROR     The device reported an error while writing back the data.
-  @retval EFI_NO_MEDIA         There is no media in the device.
-
-**/
-STATIC
-EFI_STATUS
-EFIAPI
-BlockIoFlushBlocks (
+STATIC EFI_STATUS EFIAPI BlockIoFlushBlocks (
   IN EFI_BLOCK_IO_PROTOCOL *This
   )
 {
-  BLOCK_IO_DEVICE    *BlockIoDevice;
-  EFI_BLOCK_IO_PROTOCOL *ParentBlockIo;
-  EFI_STATUS         Status;
-  
-  if (This == NULL) {
-    return EFI_INVALID_PARAMETER;
-  }
-  
-  BlockIoDevice = BLOCK_IO_DEVICE_FROM_BLOCK_IO_THIS (This);
-  
-  // For logical partitions, forward the flush to the parent BlockIo
-  if (BlockIoDevice->Media.LogicalPartition) {
-    Status = gBS->HandleProtocol (
-                    BlockIoDevice->ControllerHandle,
-                    &gEfiBlockIoProtocolGuid,
-                    (VOID **) &ParentBlockIo
-                    );
-    if (EFI_ERROR (Status)) {
-      return Status;
-    }
-    
-    return ParentBlockIo->FlushBlocks (ParentBlockIo);
-  }
-  
-  // For physical devices, forward the request to the device-specific implementation
-  if (BlockIoDevice->StorageDeviceFlushBlocks != NULL) {
-    Status = BlockIoDevice->StorageDeviceFlushBlocks (BlockIoDevice);
-    return Status;
-  }
-  
+  // Nothing to do for flush blocks operation
   return EFI_SUCCESS;
 }
 
-/**
-  Test to see if this driver supports the given controller.
-
-  @param  This                 A pointer to the EFI_DRIVER_BINDING_PROTOCOL instance.
-  @param  ControllerHandle     The handle of the controller to test.
-  @param  RemainingDevicePath  A pointer to the remaining portion of a device path.
-
-  @retval EFI_SUCCESS          This driver can support the given controller
-  @retval Others               This driver cannot support the given controller
-
-**/
-STATIC
+// Main entry point for the driver
 EFI_STATUS
 EFIAPI
-BlockDeviceDriverSupported (
-  IN EFI_DRIVER_BINDING_PROTOCOL *This,
-  IN EFI_HANDLE                  ControllerHandle,
-  IN EFI_DEVICE_PATH_PROTOCOL    *RemainingDevicePath OPTIONAL
+BlockDeviceInitialize (
+  IN EFI_HANDLE         ImageHandle,
+  IN EFI_SYSTEM_TABLE   *SystemTable
   )
 {
-  EFI_STATUS          Status;
-  SDHC_PROTOCOL       *SdhcProtocol;
-
-  // Check if SDHC protocol is supported
-  Status = gBS->OpenProtocol (
-                  ControllerHandle,
-                  &gSdhcProtocolGuid,
-                  (VOID **) &SdhcProtocol,
-                  This->DriverBindingHandle,
-                  ControllerHandle,
-                  EFI_OPEN_PROTOCOL_BY_DRIVER
-                  );
-  if (EFI_ERROR (Status)) {
+  EFI_STATUS Status;
+  BLOCK_DEVICE *Dev;
+  
+  DEBUG((EFI_D_INFO, "BlockDeviceDxe: Entry point\n"));
+  
+  // Allocate and initialize the block device
+  Dev = AllocateZeroPool(sizeof(BLOCK_DEVICE));
+  if (Dev == NULL) {
+    return EFI_OUT_OF_RESOURCES;
+  }
+  
+  Dev->Signature = BLOCK_DEVICE_SIGNATURE;
+  
+  // Set up the Block I/O protocol
+  Dev->BlockIo.Revision = EFI_BLOCK_IO_PROTOCOL_REVISION3;
+  Dev->BlockIo.Media = &Dev->Media;
+  Dev->BlockIo.Reset = BlockIoReset;
+  Dev->BlockIo.ReadBlocks = BlockIoReadBlocks;
+  Dev->BlockIo.WriteBlocks = BlockIoWriteBlocks;
+  Dev->BlockIo.FlushBlocks = BlockIoFlushBlocks;
+  
+  // Set up device path
+  CopyMem(&Dev->DevicePath, &mDevicePath, sizeof(BLOCK_DEVICE_DEVICE_PATH));
+  
+  // Initialize the UFS device
+  Status = InitializeUfsDevice(Dev);
+  if (EFI_ERROR(Status)) {
+    DEBUG((EFI_D_ERROR, "BlockDeviceDxe: Failed to initialize UFS device: %r\n", Status));
+    FreePool(Dev);
     return Status;
   }
-
-  // Close the protocol as we're just checking for its presence
-  gBS->CloseProtocol (
-         ControllerHandle,
-         &gSdhcProtocolGuid,
-         This->DriverBindingHandle,
-         ControllerHandle
-         );
-
-  return EFI_SUCCESS;
-}
-
-/**
-  Start this driver on the given controller.
-
-  @param  This                 A pointer to the EFI_DRIVER_BINDING_PROTOCOL instance.
-  @param  ControllerHandle     The handle of the controller to start.
-  @param  RemainingDevicePath  A pointer to the remaining portion of a device path.
-
-  @retval EFI_SUCCESS          This driver is started on ControllerHandle.
-  @retval Others               This driver is not started on ControllerHandle.
-
-**/
-STATIC
-EFI_STATUS
-EFIAPI
-BlockDeviceDriverStart (
-  IN EFI_DRIVER_BINDING_PROTOCOL *This,
-  IN EFI_HANDLE                  ControllerHandle,
-  IN EFI_DEVICE_PATH_PROTOCOL    *RemainingDevicePath OPTIONAL
-  )
-{
-  EFI_STATUS                Status;
-  SDHC_PROTOCOL             *SdhcProtocol;
-  BLOCK_IO_DEVICE           *BlockIoDevice;
-  EFI_DEVICE_PATH_PROTOCOL  *DevicePath;
-
-  // Open SDHC protocol
-  Status = gBS->OpenProtocol (
-                  ControllerHandle,
-                  &gSdhcProtocolGuid,
-                  (VOID **) &SdhcProtocol,
-                  This->DriverBindingHandle,
-                  ControllerHandle,
-                  EFI_OPEN_PROTOCOL_BY_DRIVER
-                  );
-  if (EFI_ERROR (Status)) {
-    return Status;
-  }
-
-  // Get the device path
-  Status = gBS->OpenProtocol (
-                  ControllerHandle,
-                  &gEfiDevicePathProtocolGuid,
-                  (VOID **) &DevicePath,
-                  This->DriverBindingHandle,
-                  ControllerHandle,
-                  EFI_OPEN_PROTOCOL_GET_PROTOCOL
-                  );
-  if (EFI_ERROR (Status)) {
-    DevicePath = NULL;
-  }
-
-  // Allocate device instance
-  BlockIoDevice = AllocateZeroPool (sizeof (BLOCK_IO_DEVICE));
-  if (BlockIoDevice == NULL) {
-    Status = EFI_OUT_OF_RESOURCES;
-    goto ErrorExit;
-  }
-
-  // Initialize the block device
-  BlockIoDevice->Signature = BLOCK_IO_DEVICE_SIGNATURE;
-  BlockIoDevice->ControllerHandle = ControllerHandle;
-
-  // Copy BlockIo protocol template
-  CopyMem (&BlockIoDevice->BlockIo, &mBlockIoProtocol, sizeof (EFI_BLOCK_IO_PROTOCOL));
   
-  // Set Media pointer
-  BlockIoDevice->BlockIo.Media = &BlockIoDevice->Media;
-  
-  // Set up the storage device
-  Status = SdhcInitialize (SdhcProtocol, BlockIoDevice);
-  if (EFI_ERROR (Status)) {
-    BLOCKDEV_DEBUG ((DEBUG_ERROR, "BlockDeviceDriverStart: Failed to initialize SDHC device: %r\n", Status));
-    goto ErrorExit;
-  }
-
-  // Create a device path for this device
-  if (DevicePath != NULL) {
-    BlockIoDevice->DevicePath = DuplicateDevicePath (DevicePath);
-    if (BlockIoDevice->DevicePath == NULL) {
-      Status = EFI_OUT_OF_RESOURCES;
-      goto ErrorExit;
-    }
-  } else {
-    // Create a minimal device path
-    BlockIoDevice->DevicePath = CreateDeviceNode (
-                                  HARDWARE_DEVICE_PATH,
-                                  HW_VENDOR_DP,
-                                  (UINT16) sizeof (VENDOR_DEVICE_PATH)
-                                  );
-    if (BlockIoDevice->DevicePath == NULL) {
-      Status = EFI_OUT_OF_RESOURCES;
-      goto ErrorExit;
-    }
-    
-    // Set a unique GUID for the device
-    VENDOR_DEVICE_PATH *VendorPath = (VENDOR_DEVICE_PATH *) BlockIoDevice->DevicePath;
-    VendorPath->Guid.Data1 = 0xB25C2A96;
-    VendorPath->Guid.Data2 = 0xD146;
-    VendorPath->Guid.Data3 = 0x4376;
-    VendorPath->Guid.Data4[0] = 0xBD;
-    VendorPath->Guid.Data4[1] = 0x6D;
-    VendorPath->Guid.Data4[2] = 0x4A;
-    VendorPath->Guid.Data4[3] = 0x96;
-    VendorPath->Guid.Data4[4] = 0xC3;
-    VendorPath->Guid.Data4[5] = 0x25;
-    VendorPath->Guid.Data4[6] = 0xF5;
-    VendorPath->Guid.Data4[7] = 0xE6;
-  }
-
   // Install protocols
-  Status = gBS->InstallMultipleProtocolInterfaces (
-                  &ControllerHandle,
-                  &gEfiBlockIoProtocolGuid,
-                  &BlockIoDevice->BlockIo,
-                  &gEfiDevicePathProtocolGuid,
-                  BlockIoDevice->DevicePath,
-                  NULL
-                  );
-  if (EFI_ERROR (Status)) {
-    BLOCKDEV_DEBUG ((DEBUG_ERROR, "BlockDeviceDriverStart: Failed to install protocols: %r\n", Status));
-    goto ErrorExit;
-  }
-
-  // Detect and handle partitions
-  Status = DetectPartitions (
-             &BlockIoDevice->BlockIo,
-             BlockIoDevice->DevicePath,
-             BlockIoDevice
-             );
-  if (EFI_ERROR (Status) && Status != EFI_NOT_FOUND) {
-    BLOCKDEV_DEBUG ((DEBUG_WARN, "BlockDeviceDriverStart: Partition detection failed: %r\n", Status));
-    // Continue anyway - we still have the base block device
-  }
-
-  BLOCKDEV_DEBUG ((DEBUG_INFO, "BlockDeviceDriverStart: Block device driver started successfully\n"));
-  return EFI_SUCCESS;
-
-ErrorExit:
-  if (BlockIoDevice != NULL) {
-    if (BlockIoDevice->DevicePath != NULL) {
-      FreePool (BlockIoDevice->DevicePath);
-    }
-    FreePool (BlockIoDevice);
-  }
+  Status = gBS->InstallMultipleProtocolInterfaces(
+                 &Dev->Handle,
+                 &gEfiBlockIoProtocolGuid, &Dev->BlockIo,
+                 &gEfiDevicePathProtocolGuid, &Dev->DevicePath,
+                 NULL
+               );
   
-  gBS->CloseProtocol (
-         ControllerHandle,
-         &gSdhcProtocolGuid,
-         This->DriverBindingHandle,
-         ControllerHandle
-         );
-  
-  return Status;
-}
-
-/**
-  Stop this driver on ControllerHandle.
-
-  @param  This                 A pointer to the EFI_DRIVER_BINDING_PROTOCOL instance.
-  @param  ControllerHandle     The handle of the controller to stop.
-  @param  NumberOfChildren     The number of child device handles in ChildHandleBuffer.
-  @param  ChildHandleBuffer    An array of child handles to be freed.
-
-  @retval EFI_SUCCESS          This driver is removed from ControllerHandle.
-  @retval Others               This driver was not removed from ControllerHandle.
-
-**/
-STATIC
-EFI_STATUS
-EFIAPI
-BlockDeviceDriverStop (
-  IN  EFI_DRIVER_BINDING_PROTOCOL *This,
-  IN  EFI_HANDLE                  ControllerHandle,
-  IN  UINTN                       NumberOfChildren,
-  IN  EFI_HANDLE                  *ChildHandleBuffer
-  )
-{
-  EFI_STATUS                Status;
-  EFI_BLOCK_IO_PROTOCOL     *BlockIo;
-  BLOCK_IO_DEVICE           *BlockIoDevice;
-  UINTN                     Index;
-
-  // Close all child handles first
-  for (Index = 0; Index < NumberOfChildren; Index++) {
-    Status = gBS->OpenProtocol (
-                    ChildHandleBuffer[Index],
-                    &gEfiBlockIoProtocolGuid,
-                    (VOID **) &BlockIo,
-                    This->DriverBindingHandle,
-                    ControllerHandle,
-                    EFI_OPEN_PROTOCOL_GET_PROTOCOL
-                    );
-    if (EFI_ERROR (Status)) {
-      continue;
-    }
-
-    BlockIoDevice = BLOCK_IO_DEVICE_FROM_BLOCK_IO_THIS (BlockIo);
-
-    Status = gBS->UninstallMultipleProtocolInterfaces (
-                    ChildHandleBuffer[Index],
-                    &gEfiBlockIoProtocolGuid,
-                    &BlockIoDevice->BlockIo,
-                    &gEfiDevicePathProtocolGuid,
-                    BlockIoDevice->DevicePath,
-                    NULL
-                    );
-    if (EFI_ERROR (Status)) {
-      continue;
-    }
-
-    FreePool (BlockIoDevice->DevicePath);
-    FreePool (BlockIoDevice);
-  }
-
-  // Now close the controller handle
-  Status = gBS->OpenProtocol (
-                  ControllerHandle,
-                  &gEfiBlockIoProtocolGuid,
-                  (VOID **) &BlockIo,
-                  This->DriverBindingHandle,
-                  ControllerHandle,
-                  EFI_OPEN_PROTOCOL_GET_PROTOCOL
-                  );
-  if (!EFI_ERROR (Status)) {
-    BlockIoDevice = BLOCK_IO_DEVICE_FROM_BLOCK_IO_THIS (BlockIo);
-
-    Status = gBS->UninstallMultipleProtocolInterfaces (
-                    ControllerHandle,
-                    &gEfiBlockIoProtocolGuid,
-                    &BlockIoDevice->BlockIo,
-                    &gEfiDevicePathProtocolGuid,
-                    BlockIoDevice->DevicePath,
-                    NULL
-                    );
-    if (!EFI_ERROR (Status)) {
-      FreePool (BlockIoDevice->DevicePath);
-      FreePool (BlockIoDevice);
-    }
-  }
-
-  // Close SDHC protocol
-  gBS->CloseProtocol (
-         ControllerHandle,
-         &gSdhcProtocolGuid,
-         This->DriverBindingHandle,
-         ControllerHandle
-         );
-
-  return EFI_SUCCESS;
-}
-
-/**
-  Initialize SDHC device.
-
-  @param  SdhcProtocol         Pointer to the SDHC protocol instance.
-  @param  BlockIoDevice        Block device info structure.
-
-  @retval EFI_SUCCESS          The SDHC device was initialized successfully.
-  @retval Others               The SDHC device failed to initialize.
-**/
-EFI_STATUS
-SdhcInitialize (
-  IN  SDHC_PROTOCOL     *SdhcProtocol,
-  IN  BLOCK_IO_DEVICE   *BlockIoDevice
-  )
-{
-  EFI_STATUS  Status;
-  UINT64      CardSize;
-  UINT32      BlockSize;
-  
-  // Initialize the SD card
-  Status = SdhcProtocol->Initialize (SdhcProtocol);
-  if (EFI_ERROR (Status)) {
-    BLOCKDEV_DEBUG ((DEBUG_ERROR, "SdhcInitialize: SD card initialization failed: %r\n", Status));
+  if (EFI_ERROR(Status)) {
+    DEBUG((EFI_D_ERROR, "BlockDeviceDxe: Failed to install protocols: %r\n", Status));
+    FreePool(Dev);
     return Status;
   }
   
-  // Get card information
-  Status = SdhcProtocol->GetCardInfo (
-                           SdhcProtocol,
-                           &CardSize,
-                           &BlockSize
-                           );
-  if (EFI_ERROR (Status)) {
-    BLOCKDEV_DEBUG ((DEBUG_ERROR, "SdhcInitialize: Failed to get card info: %r\n", Status));
-    return Status;
+  // Create partition devices
+  Status = CreatePartitionDevices(Dev);
+  if (EFI_ERROR(Status)) {
+    DEBUG((EFI_D_ERROR, "BlockDeviceDxe: Failed to create partition devices: %r\n", Status));
+    // We continue even if this fails, as the main device is still available
   }
   
-  // Set up media info
-  BlockIoDevice->Media.MediaId = 1;
-  BlockIoDevice->Media.RemovableMedia = TRUE;
-  BlockIoDevice->Media.MediaPresent = TRUE;
-  BlockIoDevice->Media.LogicalPartition = FALSE;
-  BlockIoDevice->Media.ReadOnly = FALSE;
-  BlockIoDevice->Media.WriteCaching = FALSE;
-  BlockIoDevice->Media.BlockSize = BlockSize;
-  BlockIoDevice->Media.IoAlign = 4;  // 4 byte alignment
-  BlockIoDevice->Media.LastBlock = DivU64x32 (CardSize, BlockSize) - 1;
-  
-  // Set up device-specific functions
-  BlockIoDevice->StorageDeviceReadBlocks = SdhcReadBlocks;
-  BlockIoDevice->StorageDeviceWriteBlocks = SdhcWriteBlocks;
-  BlockIoDevice->StorageDeviceFlushBlocks = SdhcFlushBlocks;
-  
-  // Save protocol for later use
-  BlockIoDevice->SdhcProtocol = SdhcProtocol;
-  
-  BLOCKDEV_DEBUG ((DEBUG_INFO, "SdhcInitialize: SD card initialized successfully\n"));
-  BLOCKDEV_DEBUG((DEBUG_INFO, "SdhcInitialize: Card size: %ld bytes, block size: %d bytes, last block: %ld\n", 
-               CardSize, BlockSize, BlockIoDevice->Media.LastBlock));
-  
+  DEBUG((EFI_D_INFO, "BlockDeviceDxe: Initialization complete\n"));
   return EFI_SUCCESS;
-}
-
-/**
-  Read blocks from SDHC device.
-
-  @param  BlockIoDevice        Block device info structure.
-  @param  MediaId              The media ID.
-  @param  Lba                  The logical block address to read from.
-  @param  BufferSize           Size of the buffer to read.
-  @param  Buffer               Buffer to receive the read data.
-
-  @retval EFI_SUCCESS          The data was read successfully.
-  @retval Others               The read operation failed.
-**/
-EFI_STATUS
-SdhcReadBlocks (
-  IN  BLOCK_IO_DEVICE   *BlockIoDevice,
-  IN  UINT32            MediaId,
-  IN  EFI_LBA           Lba,
-  IN  UINTN             BufferSize,
-  OUT VOID              *Buffer
-  )
-{
-  EFI_STATUS      Status;
-  SDHC_PROTOCOL   *SdhcProtocol;
-  UINT32          NumBlocks;
-  
-  if (Buffer == NULL) {
-    return EFI_INVALID_PARAMETER;
-  }
-  
-  if (MediaId != BlockIoDevice->Media.MediaId) {
-    return EFI_MEDIA_CHANGED;
-  }
-  
-  if (Lba > BlockIoDevice->Media.LastBlock) {
-    return EFI_INVALID_PARAMETER;
-  }
-  
-  if (BufferSize % BlockIoDevice->Media.BlockSize != 0) {
-    return EFI_BAD_BUFFER_SIZE;
-  }
-  
-  SdhcProtocol = BlockIoDevice->SdhcProtocol;
-  NumBlocks = (UINT32)(BufferSize / BlockIoDevice->Media.BlockSize);
-  
-  BLOCKDEV_DEBUG ((DEBUG_INFO, "SdhcReadBlocks: Reading %d blocks from LBA 0x%lx\n", NumBlocks, Lba));
-  
-  Status = SdhcProtocol->ReadBlocks (
-                           SdhcProtocol,
-                           (UINT32)Lba,
-                           NumBlocks,
-                           Buffer
-                           );
-  
-  return Status;
-}
-
-/**
-  Write blocks to SDHC device.
-
-  @param  BlockIoDevice        Block device info structure.
-  @param  MediaId              The media ID.
-  @param  Lba                  The logical block address to write to.
-  @param  BufferSize           Size of the buffer to write.
-  @param  Buffer               Buffer containing the data to write.
-
-  @retval EFI_SUCCESS          The data was written successfully.
-  @retval Others               The write operation failed.
-**/
-EFI_STATUS
-SdhcWriteBlocks (
-  IN  BLOCK_IO_DEVICE   *BlockIoDevice,
-  IN  UINT32            MediaId,
-  IN  EFI_LBA           Lba,
-  IN  UINTN             BufferSize,
-  IN  VOID              *Buffer
-  )
-{
-  EFI_STATUS      Status;
-  SDHC_PROTOCOL   *SdhcProtocol;
-  UINT32          NumBlocks;
-  
-  if (Buffer == NULL) {
-    return EFI_INVALID_PARAMETER;
-  }
-  
-  if (MediaId != BlockIoDevice->Media.MediaId) {
-    return EFI_MEDIA_CHANGED;
-  }
-  
-  if (Lba > BlockIoDevice->Media.LastBlock) {
-    return EFI_INVALID_PARAMETER;
-  }
-  
-  if (BufferSize % BlockIoDevice->Media.BlockSize != 0) {
-    return EFI_BAD_BUFFER_SIZE;
-  }
-  
-  if (BlockIoDevice->Media.ReadOnly) {
-    return EFI_WRITE_PROTECTED;
-  }
-  
-  SdhcProtocol = BlockIoDevice->SdhcProtocol;
-  NumBlocks = (UINT32)(BufferSize / BlockIoDevice->Media.BlockSize);
-  
-  BLOCKDEV_DEBUG ((DEBUG_INFO, "SdhcWriteBlocks: Writing %d blocks to LBA 0x%lx\n", NumBlocks, Lba));
-  
-  Status = SdhcProtocol->WriteBlocks (
-                            SdhcProtocol,
-                            (UINT32)Lba,
-                            NumBlocks,
-                            Buffer
-                            );
-  
-  return Status;
-}
-
-/**
-  Flush blocks on SDHC device.
-
-  @param  BlockIoDevice        Block device info structure.
-
-  @retval EFI_SUCCESS          The blocks were flushed successfully.
-  @retval Others               The flush operation failed.
-**/
-EFI_STATUS
-SdhcFlushBlocks (
-  IN  BLOCK_IO_DEVICE   *BlockIoDevice
-  )
-{
-  // Most SD cards don't require explicit flush
-  return EFI_SUCCESS;
-}
-
-/**
-  Entry point for the Block Device driver.
-
-  @param  ImageHandle          Image handle.
-  @param  SystemTable          Pointer to the system table.
-
-  @retval EFI_SUCCESS          Driver loaded successfully.
-  @retval Others               Failed to load driver.
-**/
-EFI_STATUS
-EFIAPI
-BlockDeviceDxeInitialize (
-  IN EFI_HANDLE        ImageHandle,
-  IN EFI_SYSTEM_TABLE  *SystemTable
-  )
-{
-  EFI_STATUS  Status;
-
-  // Set driver binding information
-  mDriverBinding.ImageHandle = ImageHandle;
-  mDriverBinding.DriverBindingHandle = ImageHandle;
-
-  // Install driver binding protocol
-  Status = gBS->InstallMultipleProtocolInterfaces (
-                  &ImageHandle,
-                  &gEfiDriverBindingProtocolGuid,
-                  &mDriverBinding,
-                  NULL
-                  );
-
-  BLOCKDEV_DEBUG ((DEBUG_INFO, "BlockDeviceDxeInitialize: Driver initialized with status %r\n", Status));
-  return Status;
 }
