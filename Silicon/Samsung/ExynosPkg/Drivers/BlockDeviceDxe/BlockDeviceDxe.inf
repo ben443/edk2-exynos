@@ -1,1 +1,51 @@
+#  Block Device Driver for Samsung Exynos devices
+#
+#  This driver is responsible for detecting and exposing block devices on Exynos-based 
+#  platforms, with improved partition detection support.
+#
+#  Copyright (c) 2023-2024, EDK2 Contributors
+#
+#  SPDX-License-Identifier: BSD-2-Clause-Patent
+##
 
+[Defines]
+  INF_VERSION                    = 0x0001001A
+  BASE_NAME                      = BlockDeviceDxe
+  FILE_GUID                      = 0A1E4EF9-5EEF-459F-80A5-832C7115C7CA
+  MODULE_TYPE                    = UEFI_DRIVER
+  VERSION_STRING                 = 1.0
+  ENTRY_POINT                    = BlockDeviceDxeInitialize
+
+[Sources]
+  BlockDeviceDxe.c
+  BlockDeviceDxe.h
+
+[Packages]
+  MdePkg/MdePkg.dec
+  ExynosPkg/ExynosPkg.dec
+
+[LibraryClasses]
+  BaseLib
+  BaseMemoryLib
+  DebugLib
+  DevicePathLib
+  DxeServicesTableLib
+  MemoryAllocationLib
+  PcdLib
+  UefiBootServicesTableLib
+  UefiDriverEntryPoint
+  UefiLib
+  UefiRuntimeServicesTableLib
+
+[Protocols]
+  gSdhcProtocolGuid                       ## CONSUMES
+  gEfiBlockIoProtocolGuid                 ## PRODUCES
+  gEfiDevicePathProtocolGuid              ## PRODUCES
+  gEfiDriverBindingProtocolGuid           ## PRODUCES
+  gEfiCrc32ServiceProtocolGuid            ## CONSUMES
+
+[Guids]
+  gEfiPartTypeUnusedGuid                  ## CONSUMES
+
+[Depex]
+  TRUE
