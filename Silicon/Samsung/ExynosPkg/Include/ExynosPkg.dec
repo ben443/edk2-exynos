@@ -1,0 +1,33 @@
+# Samsung Exynos Platform Package
+#
+# Copyright (c) 2023-2024, EDK2 Contributors
+#
+# SPDX-License-Identifier: BSD-2-Clause-Patent
+##
+
+[Defines]
+  DEC_SPECIFICATION              = 0x00010005
+  PACKAGE_NAME                   = ExynosPkg
+  PACKAGE_GUID                   = 4eb79aad-4c90-41db-a266-13c35b567a54
+  PACKAGE_VERSION                = 0.1
+
+[Includes]
+  Include
+
+[Guids]
+  gExynosPkgTokenSpaceGuid = { 0x72d78ea6, 0x4dee, 0x11ea, { 0x8e, 0x10, 0x87, 0xb3, 0x7c, 0x57, 0x33, 0x5 } }
+  gEfiPartTypeUnusedGuid   = { 0x00000000, 0x0000, 0x0000, { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } }
+
+[Protocols]
+  gSdhcProtocolGuid = { 0x9a4e9246, 0xd553, 0x40d9, { 0xa1, 0x7e, 0xc0, 0xc7, 0xad, 0x6b, 0xea, 0x27 } }
+  gEfiCrc32ServiceProtocolGuid = { 0xf2765dec, 0x6b41, 0x440b, { 0xbd, 0x81, 0x09, 0x37, 0xe8, 0x9e, 0x34, 0x57 } }
+
+[PcdsFeatureFlag]
+  gExynosPkgTokenSpaceGuid.PcdExynos990SocEnable|FALSE|BOOLEAN|0x00000001
+  gExynosPkgTokenSpaceGuid.PcdEnableMultiUartSupport|TRUE|BOOLEAN|0x00000002
+
+[PcdsFixedAtBuild, PcdsPatchableInModule]
+  gExynosPkgTokenSpaceGuid.PcdUartClkInHz|24000000|UINT32|0x00010001
+  gExynosPkgTokenSpaceGuid.PcdGicDistributorBase|0x10101000|UINT32|0x00010002
+  gExynosPkgTokenSpaceGuid.PcdGicRedistributorsBase|0x10102000|UINT32|0x00010003
+  gExynosPkgTokenSpaceGuid.PcdGicInterruptInterfaceBase|0|UINT32|0x00010004
