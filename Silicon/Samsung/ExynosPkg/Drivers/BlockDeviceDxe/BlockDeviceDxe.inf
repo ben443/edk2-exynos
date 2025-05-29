@@ -1,51 +1,47 @@
-#  Block Device Driver for Samsung Exynos devices
-#
-#  This driver is responsible for detecting and exposing block devices on Exynos-based 
-#  platforms, with improved partition detection support.
+## @file
+#  Block Device driver for Exynos platform
 #
 #  Copyright (c) 2023-2024, EDK2 Contributors
 #
 #  SPDX-License-Identifier: BSD-2-Clause-Patent
+#
 ##
 
 [Defines]
-  INF_VERSION                    = 0x0001001A
+  INF_VERSION                    = 0x00010005
   BASE_NAME                      = BlockDeviceDxe
-  FILE_GUID                      = 0A1E4EF9-5EEF-459F-80A5-832C7115C7CA
-  MODULE_TYPE                    = UEFI_DRIVER
+  FILE_GUID                      = 0a574b62-c32e-4a87-9d13-53b30b5fe8f9
+  MODULE_TYPE                    = DXE_DRIVER
   VERSION_STRING                 = 1.0
-  ENTRY_POINT                    = BlockDeviceDxeInitialize
+  ENTRY_POINT                    = BlockDeviceInitialize
 
-[Sources]
+[Sources.common]
   BlockDeviceDxe.c
   BlockDeviceDxe.h
 
 [Packages]
   MdePkg/MdePkg.dec
+  MdeModulePkg/MdeModulePkg.dec
   ExynosPkg/ExynosPkg.dec
 
 [LibraryClasses]
-  BaseLib
+  UefiDriverEntryPoint
+  UefiBootServicesTableLib
+  MemoryAllocationLib
   BaseMemoryLib
   DebugLib
+  IoLib
   DevicePathLib
-  DxeServicesTableLib
-  MemoryAllocationLib
+  BaseLib
   PcdLib
-  UefiBootServicesTableLib
-  UefiDriverEntryPoint
-  UefiLib
-  UefiRuntimeServicesTableLib
 
 [Protocols]
-  gSdhcProtocolGuid                       ## CONSUMES
-  gEfiBlockIoProtocolGuid                 ## PRODUCES
-  gEfiDevicePathProtocolGuid              ## PRODUCES
-  gEfiDriverBindingProtocolGuid           ## PRODUCES
-  gEfiCrc32ServiceProtocolGuid            ## CONSUMES
+  gEfiBlockIoProtocolGuid
+  gEfiDevicePathProtocolGuid
+  gEfiDiskIoProtocolGuid
 
 [Guids]
-  gEfiPartTypeUnusedGuid                  ## CONSUMES
+  gEfiPartTypeSystemPartGuid
 
 [Depex]
   TRUE
