@@ -13,7 +13,7 @@ jobs:
       matrix:
         device:
           # Exynos 7885
-          - a10
+          # a10
           # Exynos 990
           - s20
 
