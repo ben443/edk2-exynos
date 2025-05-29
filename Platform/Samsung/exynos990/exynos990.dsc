@@ -1,3 +1,4 @@
+## @file
 # Samsung Exynos 990 platform description file
 #
 # Copyright (c) 2023-2024, EDK2 Contributors
